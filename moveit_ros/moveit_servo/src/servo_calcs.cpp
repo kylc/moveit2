@@ -49,6 +49,7 @@
 #include <moveit_servo/enforce_limits.hpp>
 #include <moveit_servo/servo_calcs.h>
 #include <moveit_servo/utilities.h>
+#include <moveit_servo/collision_check.h>
 
 using namespace std::chrono_literals;  // for s, ms, etc.
 
@@ -681,6 +682,52 @@ bool ServoCalcs::internalServoUpdate(Eigen::ArrayXd& delta_theta,
 
   // Apply collision scaling
   double collision_scale = collision_velocity_scale_;
+
+  {
+    const double dt = 0.01;  // TODO: How to get the real value?
+    auto scene = planning_scene_monitor::LockedPlanningSceneRO(planning_scene_monitor_);
+
+    // Helper function to compute the distance to the nearest obstacle in a
+    // given joint configuration.
+    auto compute_collision_dist = [&](moveit::core::RobotState& state) {
+      // TODO: Seems to be necessary for some reason
+      state.updateLinkTransforms();
+      state.updateCollisionBodyTransforms();
+
+      auto req = collision_detection::CollisionRequest();
+      req.group_name = parameters_->move_group_name;
+      req.distance = true;
+
+      auto res = collision_detection::CollisionResult();
+      scene->getCollisionEnv()->checkRobotCollision(req, res, state);
+      return res.distance;
+    };
+
+    // Compute collision distance for two states: the current state, and the
+    // current state integrated forward with the joint velocity command. We will
+    // use this to estimate the time derivative of the collision distance
+    // function.
+    moveit::core::RobotState state_t0 = scene->getCurrentState();
+    double dist_t0 = compute_collision_dist(state_t0);
+
+    // TODO: This seems like the wrong way to do this ;).
+    moveit::core::RobotState state_t1 = state_t0;
+    Eigen::VectorXd q;
+    state_t1.copyJointGroupPositions(joint_model_group_, q);
+    q.array() += delta_theta * dt;
+    state_t1.setJointGroupPositions(joint_model_group_, q);
+    double dist_t1 = compute_collision_dist(state_t1);
+
+    // If the distance to the nearest obstacle is increasing with the given
+    // joint velocity, then there is no need to limit the joint velocities. Let
+    // the robot roam free!
+    double ddot = (dist_t1 - dist_t0) / dt;
+    if (ddot > 0.0)
+    {
+      collision_scale = 1.0;
+    }
+  }
+
   if (collision_scale > 0 && collision_scale < 1)
   {
     status_ = StatusCode::DECELERATE_FOR_COLLISION;
