@@ -54,6 +54,9 @@ foreach(Dependency IN ITEMS ${THIS_PACKAGE_INCLUDE_DEPENDS})
   find_package(${Dependency} REQUIRED)
 endforeach()
 
+list(APPEND CMAKE_PREFIX_PATH /opt/drake/lib)
+find_package(drake REQUIRED)
+
 include_directories(
   include
 )
@@ -82,6 +85,7 @@ add_library(${SERVO_LIB_NAME} SHARED
 set_target_properties(${SERVO_LIB_NAME} PROPERTIES VERSION "${${PROJECT_NAME}_VERSION}")
 ament_target_dependencies(${SERVO_LIB_NAME} ${THIS_PACKAGE_INCLUDE_DEPENDS})
 target_link_libraries(${SERVO_LIB_NAME} ${SERVO_PARAM_LIB_NAME})
+target_link_libraries(${SERVO_LIB_NAME} drake::drake)
 
 add_library(${POSE_TRACKING} SHARED src/pose_tracking.cpp)
 ament_target_dependencies(${POSE_TRACKING} ${THIS_PACKAGE_INCLUDE_DEPENDS})

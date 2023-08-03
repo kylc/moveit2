@@ -50,6 +50,8 @@
 #include <moveit_servo/servo_calcs.h>
 #include <moveit_servo/utilities.h>
 
+#include <drake/multibody/inverse_kinematics/differential_inverse_kinematics.h>
+
 using namespace std::chrono_literals;  // for s, ms, etc.
 
 namespace moveit_servo
@@ -572,14 +574,76 @@ bool ServoCalcs::cartesianServoCalcs(geometry_msgs::msg::TwistStamped& cmd,
 
   removeDriftDimensions(jacobian, delta_x);
 
+  // TODO: We don't need to solve the pseudo-inverse _here_ in the case of
+  // differential IK.
   Eigen::JacobiSVD<Eigen::MatrixXd> svd =
       Eigen::JacobiSVD<Eigen::MatrixXd>(jacobian, Eigen::ComputeThinU | Eigen::ComputeThinV);
   Eigen::MatrixXd matrix_s = svd.singularValues().asDiagonal();
   Eigen::MatrixXd pseudo_inverse = svd.matrixV() * matrix_s.inverse() * svd.matrixU().transpose();
 
+  // TODO: After all, why shouldn't we? :)
+  const bool use_differential_ik = true;
+
+  if (use_differential_ik)
+  {
+    using namespace drake::multibody;
+
+    // TODO: This explicitly assumes that num_positions == num_velocities, which
+    // would not be true in the case of e.g. quaternion axes. How does MoveIt
+    // handle a reduced-DoF tangent space?
+    const size_t N = joint_model_group_->getActiveVariableCount();
+
+    Eigen::VectorXd q_current;
+    current_state_->copyJointGroupPositions(joint_model_group_, q_current);
+
+    Eigen::VectorXd v_current;
+    current_state_->copyJointGroupVelocities(joint_model_group_, v_current);
+
+    // TODO: Unclear the exact specifications of this Jacobian: w.r.t. what
+    // reference frame? Analytical or geometric Jacobian? Seems to work OK but
+    // should be clarified.
+    const Eigen::MatrixXd& J = jacobian;
+
+    // TODO: The DoDifferentialInverseKinematics function can handle many
+    // addition costs and constraints, e.g.:
+    // - joint position limits
+    // - end-effector velocity/acceleration constraints
+    // - nominal posture/centering cost
+    DifferentialInverseKinematicsParameters params(N, N);
+
+    // TODO: How do I get the real value from MoveIt?
+    // params.set_time_step(0.01);
+
+    // TODO: Hardcoded velocity and acceleration limits for demonstration
+    // purposes. These should be drawn from the MoveIt/Servo configuration
+    // instead.
+    const Eigen::VectorXd v_max = Eigen::VectorXd::Constant(N, 1.0);
+    const Eigen::VectorXd vdot_max = Eigen::VectorXd::Constant(N, 1.0);
+    params.set_joint_velocity_limits({ -v_max, v_max });
+    params.set_joint_acceleration_limits({ -vdot_max, vdot_max });
+
+    const auto result = DoDifferentialInverseKinematics(q_current, v_current, delta_x, J, params);
+    if (result.status == DifferentialInverseKinematicsStatus::kSolutionFound)
+    {
+      delta_theta_ = *result.joint_velocities;
+    }
+    else if (result.status == DifferentialInverseKinematicsStatus::kStuck)
+    {
+      // TODO: In this result joint velocities are still generated, they are
+      // just not guaranteed to follow the Cartesian target velocity. Is it
+      // acceptable to still use them? It may be the only way to get unstuck.
+      RCLCPP_WARN(LOGGER, "Differential inverse kinematics is stuck!");
+      return false;
+    }
+    else if (result.status == DifferentialInverseKinematicsStatus::kNoSolutionFound)
+    {
+      RCLCPP_WARN(LOGGER, "Differential inverse kinematics failed to converge to a solution!");
+      return false;
+    }
+  }
   // Convert from cartesian commands to joint commands
   // Use an IK solver plugin if we have one, otherwise use inverse Jacobian.
-  if (!use_inv_jacobian_)
+  else if (!use_inv_jacobian_)
   {
     // get a transformation matrix with the desired position change &
     // get a transformation matrix with desired orientation change
@@ -642,11 +706,17 @@ bool ServoCalcs::cartesianServoCalcs(geometry_msgs::msg::TwistStamped& cmd,
     delta_theta_ = pseudo_inverse * delta_x;
   }
 
-  delta_theta_ *= velocityScalingFactorForSingularity(joint_model_group_, delta_x, svd, pseudo_inverse,
-                                                      parameters_->hard_stop_singularity_threshold,
-                                                      parameters_->lower_singularity_threshold,
-                                                      parameters_->leaving_singularity_threshold_multiplier,
-                                                      *node_->get_clock(), current_state_, status_);
+  // The differential IK formulation already solved for joint velocities subject
+  // to joint velocity limits, so there's no need to do any heuristic scaling
+  // here.
+  if (!use_differential_ik)
+  {
+    delta_theta_ *= velocityScalingFactorForSingularity(joint_model_group_, delta_x, svd, pseudo_inverse,
+                                                        parameters_->hard_stop_singularity_threshold,
+                                                        parameters_->lower_singularity_threshold,
+                                                        parameters_->leaving_singularity_threshold_multiplier,
+                                                        *node_->get_clock(), current_state_, status_);
+  }
 
   return internalServoUpdate(delta_theta_, joint_trajectory, ServoType::CARTESIAN_SPACE);
 }
